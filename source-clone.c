@@ -118,7 +118,8 @@ static void source_clone_destroy(void *data)
 	bfree(context);
 }
 
-void source_clone_switch_source(struct source_clone *context, obs_source_t *source)
+/* Detach all audio plumbing from the current clone target. */
+static void source_clone_audio_teardown(struct source_clone *context)
 {
 	if (context->audio_wrapper) {
 		audio_wrapper_remove(context->audio_wrapper, context);
@@ -130,32 +131,41 @@ void source_clone_switch_source(struct source_clone *context, obs_source_t *sour
 		signal_handler_disconnect(sh, "audio_activate", source_clone_audio_activate, context);
 		signal_handler_disconnect(sh, "audio_deactivate", source_clone_audio_deactivate, context);
 		obs_source_remove_audio_capture_callback(prev_source, source_clone_audio_callback, context);
+		obs_source_release(prev_source);
+	}
+	obs_source_set_audio_active(context->source, false);
+}
+
+void source_clone_switch_source(struct source_clone *context, obs_source_t *source)
+{
+	source_clone_audio_teardown(context);
+	obs_source_t *prev_source = obs_weak_source_get_source(context->clone);
+	if (prev_source) {
 		if (obs_source_showing(context->source))
 			obs_source_dec_showing(prev_source);
 		if (context->active_clone && obs_source_active(context->source))
-			obs_source_dec_active(source);
+			obs_source_dec_active(prev_source);
 		obs_source_release(prev_source);
 	}
 	obs_weak_source_release(context->clone);
 	context->clone = obs_source_get_weak_source(source);
-	if (context->audio_enabled) {
+	if (context->audio_enabled && source) {
 		uint32_t flags = obs_source_get_output_flags(source);
+		if ((flags & (OBS_SOURCE_AUDIO | OBS_SOURCE_COMPOSITE)) != 0) {
+			/* The wrapper pulls the target's mix through the audio tree, so audio works
+			 * even when the target is not otherwise active (no Active Clone needed). */
+			context->audio_wrapper = audio_wrapper_get(true);
+			if (context->audio_wrapper)
+				audio_wrapper_add(context->audio_wrapper, context);
+		}
 		if ((flags & OBS_SOURCE_AUDIO) != 0) {
-			obs_source_add_audio_capture_callback(source, source_clone_audio_callback, context);
-
 			obs_source_set_audio_active(context->source, obs_source_audio_active(source));
 			signal_handler_t *sh = obs_source_get_signal_handler(source);
 			signal_handler_connect(sh, "audio_activate", source_clone_audio_activate, context);
 			signal_handler_connect(sh, "audio_deactivate", source_clone_audio_deactivate, context);
 		} else if ((flags & OBS_SOURCE_COMPOSITE) != 0) {
-			context->audio_wrapper = audio_wrapper_get(true);
-			audio_wrapper_add(context->audio_wrapper, context);
 			obs_source_set_audio_active(context->source, true);
-		} else {
-			obs_source_set_audio_active(context->source, false);
 		}
-	} else {
-		obs_source_set_audio_active(context->source, false);
 	}
 	if (source && obs_source_showing(context->source))
 		obs_source_inc_showing(source);
@@ -224,6 +234,15 @@ void source_clone_update(void *data, obs_data_t *settings)
 				source_clone_switch_source(context, source);
 			}
 			obs_source_release(source);
+		}
+	}
+	if (context->audio_enabled != audio_enabled) {
+		/* Scene clone types (and a missing source) don't go through the switch above. */
+		context->audio_enabled = audio_enabled;
+		obs_source_t *cur = obs_weak_source_get_source(context->clone);
+		if (cur) {
+			source_clone_switch_source(context, cur);
+			obs_source_release(cur);
 		}
 	}
 	context->audio_enabled = audio_enabled;

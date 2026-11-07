@@ -7,7 +7,6 @@ struct audio_wrapper_info *audio_wrapper_get(bool create)
 	obs_canvas_t *canvas = obs_get_main_canvas();
 	if (!canvas)
 		return NULL;
-	obs_canvas_release(canvas);
 
 	for (uint32_t i = MAX_CHANNELS - 1; i > 0; i--) {
 		obs_source_t *source = obs_canvas_get_channel(canvas, i);
@@ -17,12 +16,15 @@ struct audio_wrapper_info *audio_wrapper_get(bool create)
 			struct audio_wrapper_info *aw = obs_obj_get_data(source);
 			aw->channel = i;
 			obs_source_release(source);
+			obs_canvas_release(canvas);
 			return aw;
 		}
 		obs_source_release(source);
 	}
-	if (!create)
+	if (!create) {
+		obs_canvas_release(canvas);
 		return NULL;
+	}
 	obs_source_t *aws = obs_source_create_private(audio_wrapper_source.id, audio_wrapper_source.id, NULL);
 	struct audio_wrapper_info *aw = obs_obj_get_data(aws);
 	obs_source_set_muted(aws, true);
@@ -36,9 +38,11 @@ struct audio_wrapper_info *audio_wrapper_get(bool create)
 		obs_canvas_set_channel(canvas, i, aws);
 		aw->channel = i;
 		obs_source_release(aws);
+		obs_canvas_release(canvas);
 		return aw;
 	}
 	obs_source_release(aws);
+	obs_canvas_release(canvas);
 	return NULL;
 }
 
@@ -127,8 +131,16 @@ bool audio_wrapper_render(void *data, uint64_t *ts_out, struct obs_source_audio_
 		struct obs_source_audio_mix child_audio;
 		obs_source_get_audio_mix(source, &child_audio);
 		uint64_t timestamp = obs_source_get_audio_timestamp(source);
+		/* Audio inputs only fill the mixers they are assigned to. Scenes/groups report no
+		 * mixers of their own (0) and are rendered into whatever mixers are requested. */
+		uint32_t child_mixers = obs_source_get_audio_mixers(source);
+		uint32_t usable = child_mixers ? (child_mixers & mixers) : mixers;
+		if (!usable)
+			usable = child_mixers;
+		if (channels > MAX_AUDIO_CHANNELS)
+			channels = MAX_AUDIO_CHANNELS;
 		for (size_t mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
-			if ((mixers & (1 << mix)) == 0)
+			if ((usable & (1 << mix)) == 0)
 				continue;
 			pthread_mutex_lock(&clone->audio_mutex);
 			uint32_t frames = AUDIO_OUTPUT_FRAMES;
@@ -156,6 +168,13 @@ static void audio_wrapper_enum_sources(void *data, obs_source_enum_proc_t enum_c
 			continue;
 
 		if (obs_source_removed(source)) {
+			obs_source_release(source);
+			continue;
+		}
+
+		/* Only pull the target into the audio tree while the clone itself is live;
+		 * otherwise its audio would play (and show in the mixer) for hidden clones. */
+		if (active && !obs_source_active(clone->source)) {
 			obs_source_release(source);
 			continue;
 		}
